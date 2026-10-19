@@ -1,0 +1,238 @@
+name: 构建浪神文件管理器 IPA
+
+on:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 60
+
+    steps:
+      - name: 拉代码
+        uses: actions/checkout@v4
+
+      - name: 选源码包并解压
+        id: pick
+        shell: bash
+        run: |
+          set -e
+          echo "===== 仓库根目录内容 ====="
+          ls -la
+          echo "=========================="
+          echo "----- workflows 目录 -----"
+          ls -la .github/workflows || true
+          echo "--------------------------"
+
+          # 根目录里可能躺着好几个源码包（上一轮就是因为"谁排前面用谁"编了旧的 v1.2.1）。
+          # 现在的做法：优先 v1.2.9，其余按名字倒序；而且每个包都要先验证代码是不是新的，
+          # 旧包直接跳过，绝不再拿旧代码编译。
+          ZIPS=$(ls -1 2>/dev/null | grep -E '^3105-Source-.*\.zip$' || true)
+          echo "根目录发现的 3105 源码包："
+          echo "${ZIPS:-  （一个都没有）}"
+
+          CANDIDATES="3105-Source-v1.2.11.zip"
+          if [ -n "$ZIPS" ]; then
+            for f in $(printf '%s\n' "$ZIPS" | sort -r); do
+              CANDIDATES="$CANDIDATES $f"
+            done
+          fi
+
+          ZIP=""
+          for f in $CANDIDATES; do
+            [ -f "$f" ] || continue
+            if ! unzip -l "$f" 2>/dev/null | grep -q "\.xcodeproj/"; then
+              echo "跳过 $f：里面没有 .xcodeproj"
+              continue
+            fi
+            rm -rf /tmp/srcchk && mkdir -p /tmp/srcchk
+            unzip -q -o "$f" -d /tmp/srcchk
+            UTILS=$(find /tmp/srcchk -name "Utils.swift" | head -1)
+            CV=$(find /tmp/srcchk -name "ContentView.swift" | head -1)
+            PLIST=$(find /tmp/srcchk -name "Info.plist" | head -1)
+            PBX=$(find /tmp/srcchk -name "project.pbxproj" | head -1)
+            MARK=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" "$PLIST" 2>/dev/null || echo "?")
+            if [ "$MARK" = "1.2.11" ] && grep -q "CFBundleIcons" "$PLIST" 2>/dev/null && grep -q 'PRODUCT_BUNDLE_IDENTIFIER = "com.apple.mobile.MobileHouseArrest"' "$PBX" 2>/dev/null && grep -q "func deleteBackup" "$CV" 2>/dev/null && grep -q "enum PatchAudioFeedback" "$UTILS" 2>/dev/null; then
+              ZIP="$f"
+              break
+            fi
+            echo "跳过 $f：不是 v1.2.11（版本=$MARK，或包标识不是 MobileHouseArrest，或图标键缺失）"
+          done
+
+          if [ -z "$ZIP" ]; then
+            echo "::error::根目录里没有一个可用的新源码包，请把 3105-Source-v1.2.11.zip 原样传到根目录，并把旧的 3105 zip 删掉"
+            exit 1
+          fi
+
+          echo ">>> 本次使用的源码包：$ZIP"
+          echo "zip_name=$ZIP" >> "$GITHUB_OUTPUT"
+
+          rm -rf /tmp/srcchk && mkdir -p /tmp/srcchk
+          unzip -q -o "$ZIP" -d /tmp/srcchk
+          cp -R /tmp/srcchk/. .
+
+          # 关键校验：包标识必须是 MobileHouseArrest（容器读写靠它认身份），
+          # 内核偏移门必须是 26.1 截止（跟 3105 原版一致），这两条错了就别往下编了。
+          # 注意：文件里出现这两行注释不影响 grep 取到的真实值。
+          BID=$(grep -m1 'PRODUCT_BUNDLE_IDENTIFIER = ' ThreeOneOSFive.xcodeproj/project.pbxproj | sed 's/.*= //; s/;//; s/"//g')
+          GATE=$(grep -c -F 'SYSTEM_VERSION_LESS_THAN(@"26.1")' ThreeOneOSFive/kexploit/offsets.m || true)
+          BQ=$(grep -c -F 'bad_query_attempt' ThreeOneOSFive/exploit/bad_query.c || true)
+          echo ">>> 包标识：$BID"
+          echo ">>> 内核版本门 26.1 截止：$([ "$GATE" -ge 1 ] && echo 是 || echo 否)   容器查询穷举残留：$BQ （应为 0）"
+          if [ "$BID" != "com.apple.mobile.MobileHouseArrest" ]; then
+            echo "::error::包标识不对（$BID），容器读写会失效，停下"
+            exit 1
+          fi
+          VER=$(/usr/libexec/PlistBuddy -c "Print :CFBundleShortVersionString" ThreeOneOSFive/Info.plist 2>/dev/null || echo "?")
+          BUILD=$(/usr/libexec/PlistBuddy -c "Print :CFBundleVersion" ThreeOneOSFive/Info.plist 2>/dev/null || echo "?")
+          echo ">>> 准备编译的版本：$VER ($BUILD)"
+          echo "app_version=$VER" >> "$GITHUB_OUTPUT"
+          echo "app_build=$BUILD" >> "$GITHUB_OUTPUT"
+
+      - name: 定位工程
+        id: locate
+        shell: bash
+        run: |
+          set -e
+          PROJ=$(find . -maxdepth 3 -name "ThreeOneOSFive.xcodeproj" -type d | head -1)
+          if [ -z "$PROJ" ]; then
+            PROJ=$(find . -maxdepth 3 -name "*.xcodeproj" -type d | head -1)
+          fi
+          if [ -z "$PROJ" ]; then
+            echo "::error::没找到 .xcodeproj，源码包没解开或者包不对"
+            exit 1
+          fi
+          echo "project=$PROJ" >> "$GITHUB_OUTPUT"
+          echo "工程: $PROJ"
+          xcodebuild -version
+          echo "----- 工程里有哪些 target / scheme -----"
+          xcodebuild -project "$PROJ" -list 2>&1 || true
+
+      - name: 编译（不签名）
+        shell: bash
+        run: |
+          set -o pipefail
+          PROJ="${{ steps.locate.outputs.project }}"
+          echo "源码包 = ${{ steps.pick.outputs.zip_name }}"
+          echo "版本   = ${{ steps.pick.outputs.app_version }} (${{ steps.pick.outputs.app_build }})"
+          LIST=$(xcodebuild -project "$PROJ" -list 2>&1 || true)
+          SCHEME=$(echo "$LIST" | awk '/Schemes:/{f=1;next} /Targets:/{f=0} f&&NF{print $1; exit}')
+          TARGET=$(echo "$LIST" | awk '/Targets:/{f=1;next} /Build Configurations:/{f=0} f&&NF{print $1; exit}')
+          [ -z "$TARGET" ] && TARGET="OGIOS"
+          echo "Scheme=[$SCHEME]  Target=[$TARGET]"
+
+          COMMON=(
+            -project "$PROJ"
+            -configuration Release
+            -sdk iphoneos
+            -derivedDataPath "$PWD/dd"
+            CODE_SIGNING_ALLOWED=NO
+            CODE_SIGNING_REQUIRED=NO
+            CODE_SIGN_IDENTITY=""
+            SWIFT_TREAT_WARNINGS_AS_ERRORS=NO
+            GCC_TREAT_WARNINGS_AS_ERRORS=NO
+          )
+
+          set +e
+          if [ -n "$SCHEME" ]; then
+            echo ">>> 用 scheme 编译: $SCHEME"
+            xcodebuild "${COMMON[@]}" -scheme "$SCHEME" build 2>&1 | tee build.log
+            STATUS=${PIPESTATUS[0]}
+            if [ "$STATUS" -ne 0 ] && grep -q "does not contain a scheme" build.log; then
+              echo ">>> scheme 没认到，改用 target 编译"
+              xcodebuild "${COMMON[@]}" -target "$TARGET" build 2>&1 | tee build.log
+              STATUS=${PIPESTATUS[0]}
+            fi
+          else
+            echo ">>> 没有 scheme，用 target 编译: $TARGET"
+            xcodebuild "${COMMON[@]}" -target "$TARGET" build 2>&1 | tee build.log
+            STATUS=${PIPESTATUS[0]}
+          fi
+
+          if [ "$STATUS" -ne 0 ]; then
+            ERRCOUNT=$(grep -c -i "error:" build.log || true)
+            echo ""
+            echo "=========== 失败信息 ==========="
+            echo "源码包: ${{ steps.pick.outputs.zip_name }}"
+            echo "版本:   ${{ steps.pick.outputs.app_version }}"
+            echo "报错条数: $ERRCOUNT"
+            echo ""
+            echo "----- error: 全部行（带行号）-----"
+            grep -n -i "error:" build.log | head -80 || true
+            echo ""
+            echo "----- error: 前后各 6 行 -----"
+            grep -n -i -B6 -A12 "error:" build.log | head -300 || true
+            echo ""
+            echo "----- 失败的命令 -----"
+            sed -n '/The following build commands failed/,/failures)/p' build.log | head -40 || true
+            echo ""
+            echo "----- 日志最后 80 行 -----"
+            tail -80 build.log || true
+            echo "=============================================="
+            echo "::error::编译失败：源码包 ${{ steps.pick.outputs.zip_name }}，报错 $ERRCOUNT 条，看上面「error: 全部行」"
+            exit 1
+          fi
+          echo ">>> 编译通过"
+
+      - name: 失败时上传编译日志
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: build.log
+          if-no-files-found: ignore
+
+      - name: 打 unsigned IPA
+        id: pack
+        shell: bash
+        run: |
+          set -e
+          APP=$(find "$PWD/dd/Build/Products" -maxdepth 2 -name "*.app" -type d | head -1)
+          echo "APP=$APP"
+          if [ -z "$APP" ]; then echo "::error::没找到 .app"; exit 1; fi
+          NAME=$(basename "$APP" .app)
+          IPA="langshen-pak-v${{ steps.pick.outputs.app_version }}-unsigned.ipa"
+          rm -rf build && mkdir -p build/Payload
+          cp -R "$APP" build/Payload/
+          APPDIR="build/Payload/$(basename "$APP")"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleExecutable $NAME" "$APPDIR/Info.plist" || true
+
+          echo "--- 图标自检 ---"
+          for f in "AppIcon60x60@2x.png" "AppIcon76x76@2x~ipad.png"; do
+            if [ ! -f "$APPDIR/$f" ]; then
+              echo "包内缺 $f，从源码目录补进去"
+              cp "ThreeOneOSFive/$f" "$APPDIR/$f" || { echo "::error::源码里也找不到 $f"; exit 1; }
+            fi
+          done
+          ICONFILES=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconFiles:0" "$APPDIR/Info.plist" 2>/dev/null || echo "")
+          if [ -z "$ICONFILES" ]; then
+            echo "::error::包内 Info.plist 的 CFBundleIcons 是空的，装上去桌面不会显示图标，已中止"
+            exit 1
+          fi
+          ICONNAME=$(/usr/libexec/PlistBuddy -c "Print :CFBundleIcons:CFBundlePrimaryIcon:CFBundleIconName" "$APPDIR/Info.plist" 2>/dev/null || echo "")
+          echo "CFBundleIconFiles = $ICONFILES"
+          echo "CFBundleIconName  = $ICONNAME"
+          ls -l "$APPDIR" | grep -i appicon || true
+          echo "图标校验通过：桌面上会有图标"
+
+          cd build
+          /usr/bin/zip -qry "$IPA" Payload
+          rm -rf Payload
+          ls -lh "$IPA"
+          echo "ipa_name=$IPA" >> "$GITHUB_OUTPUT"
+
+      - name: 上传成品
+        uses: actions/upload-artifact@v4
+        with:
+          name: langshen-pak-v${{ steps.pick.outputs.app_version }}-unsigned
+          path: build/langshen-pak-v${{ steps.pick.outputs.app_version }}-unsigned.ipa
+          if-no-files-found: error
+
+      - name: 输出直链
+        shell: bash
+        run: |
+          echo "✅ 编好了，就在本页最下面 Artifacts"
+          echo "源码包: ${{ steps.pick.outputs.zip_name }}"
+          echo "版本:   ${{ steps.pick.outputs.app_version }} (${{ steps.pick.outputs.app_build }})"
+          echo "https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }}"
+          echo "下载 langshen-pak-v${{ steps.pick.outputs.app_version }}-unsigned → 用全能签重签（勾「重签所有框架」）"
